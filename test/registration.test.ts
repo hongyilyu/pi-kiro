@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import registerExtension from "../extensions/index";
+import registerExtension from "../src/extension";
 
 describe("extension registration", () => {
   it("calls pi.registerProvider with 'kiro' and all documented fields", async () => {

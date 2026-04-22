@@ -1,6 +1,6 @@
 // pi-kiro extension entry point.
 //
-// Referenced from package.json: "pi": { "extensions": ["./extensions"] }.
+// Referenced from package.json: "pi": { "extensions": ["./dist/extension.js"] }.
 // Called once by pi at startup; registers the kiro provider with its model
 // catalog, OAuth login, and custom streaming handler.
 //
@@ -15,9 +15,9 @@
 
 import type { Api, Model, OAuthCredentials } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { filterModelsByRegion, kiroModels, resolveApiRegion } from "../src/models";
-import { loginKiro, refreshKiroToken, type KiroCredentials } from "../src/oauth";
-import { streamKiro } from "../src/stream";
+import { filterModelsByRegion, kiroModels, resolveApiRegion } from "./models";
+import { loginKiro, refreshKiroToken, type KiroCredentials } from "./oauth";
+import { streamKiro } from "./stream";
 
 export default function (pi: ExtensionAPI): void {
   pi.registerProvider("kiro", {

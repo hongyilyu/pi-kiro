@@ -53,9 +53,22 @@ const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
 
 export interface KiroCredentials extends OAuthCredentials {
   clientId: string;
+  /**
+   * OIDC client secret from AWS SSO-OIDC client registration.
+   *
+   * SENSITIVE: persist only in secure storage (e.g. keychain, encrypted
+   * file, HTTP-only cookie). Do not log, do not send to telemetry, do not
+   * embed in URLs or query strings. Together with `refresh`, it can mint
+   * new access tokens for the user's AWS identity.
+   */
   clientSecret: string;
   region: string;
-  authMethod: "idc";
+  /**
+   * Which SSO flow produced this credential.
+   * - `builder-id`: AWS Builder ID (personal AWS account, us-east-1).
+   * - `idc`: IAM Identity Center (enterprise SSO, any region).
+   */
+  authMethod: "builder-id" | "idc";
 }
 
 interface DeviceAuthResponse {
@@ -190,7 +203,7 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
 
   const startUrl = (urlRaw ?? "").trim();
   if (!startUrl) {
-    return runDeviceCodeFlow(callbacks, BUILDER_ID_START_URL, [BUILDER_ID_REGION]);
+    return runDeviceCodeFlow(callbacks, BUILDER_ID_START_URL, [BUILDER_ID_REGION], "builder-id");
   }
   if (!startUrl.startsWith("http")) {
     throw new Error(
@@ -210,13 +223,14 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
     region ? `Connecting to ${region}…` : "Detecting your Identity Center region…",
   );
 
-  return runDeviceCodeFlow(callbacks, startUrl, regions);
+  return runDeviceCodeFlow(callbacks, startUrl, regions, "idc");
 }
 
 async function runDeviceCodeFlow(
   callbacks: OAuthLoginCallbacks,
   startUrl: string,
   regions: string[],
+  authMethod: "builder-id" | "idc",
 ): Promise<KiroCredentials> {
   let result: Awaited<ReturnType<typeof tryRegisterAndAuthorize>> | null = null;
   let detectedRegion = "";
@@ -257,13 +271,13 @@ async function runDeviceCodeFlow(
   }
 
   return {
-    refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc`,
+    refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|${authMethod}`,
     access: tok.accessToken,
     expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
     clientId: result.clientId,
     clientSecret: result.clientSecret,
     region: detectedRegion,
-    authMethod: "idc",
+    authMethod,
   };
 }
 
@@ -275,6 +289,12 @@ export async function refreshKiroToken(
   const clientId = parts[1] ?? "";
   const clientSecret = parts[2] ?? "";
   const region = (credentials as KiroCredentials).region;
+  // Preserve whatever authMethod came in. Fall back to "idc" only for
+  // pre-existing credentials written before this field was tracked; never
+  // invent "builder-id" because we can't tell the difference retroactively.
+  const inputMethod = (credentials as Partial<KiroCredentials>).authMethod;
+  const authMethod: "builder-id" | "idc" =
+    inputMethod === "builder-id" || inputMethod === "idc" ? inputMethod : "idc";
 
   if (!refreshToken || !clientId || !clientSecret || !region) {
     throw new Error(
@@ -297,12 +317,12 @@ export async function refreshKiroToken(
   };
 
   return {
-    refresh: `${data.refreshToken}|${clientId}|${clientSecret}|idc`,
+    refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     access: data.accessToken,
     expires: Date.now() + data.expiresIn * 1000 - EXPIRES_BUFFER_MS,
     clientId,
     clientSecret,
     region,
-    authMethod: "idc",
+    authMethod,
   };
 }

@@ -61,7 +61,8 @@ describe("loginKiro — Builder ID", () => {
 
     expect(creds.region).toBe("us-east-1");
     expect(creds.access).toBe("AT");
-    expect(creds.refresh).toBe("RT|CID|SEC|idc");
+    expect(creds.refresh).toBe("RT|CID|SEC|builder-id");
+    expect(creds.authMethod).toBe("builder-id");
 
     // Request 1: /client/register to us-east-1
     const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
