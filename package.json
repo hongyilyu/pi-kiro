@@ -33,15 +33,18 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.69.0",
     "@types/bun": "latest",
     "vitest": "^2.0.0"
   },
   "peerDependencies": {
     "typescript": "^5",
     "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": "^0.69.0"
   },
   "peerDependenciesMeta": {
-    "@mariozechner/pi-coding-agent": { "optional": true }
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    }
   }
 }
