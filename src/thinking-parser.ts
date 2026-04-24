@@ -6,6 +6,7 @@
 // that straddle chunk boundaries.
 
 import type { AssistantMessage, AssistantMessageEventStream, TextContent, ThinkingContent } from "@mariozechner/pi-ai";
+import { log } from "./debug";
 
 export const THINKING_START_TAG = "<thinking>";
 export const THINKING_END_TAG = "</thinking>";
@@ -50,6 +51,14 @@ export class ThinkingTagParser {
 
   processChunk(chunk: string): void {
     this.textBuffer += chunk;
+    if (log.isDebug()) {
+      log.debug("thinking.chunk", {
+        chunkLen: chunk.length,
+        bufferLen: this.textBuffer.length,
+        inThinking: this.inThinking,
+        thinkingExtracted: this.thinkingExtracted,
+      });
+    }
     while (this.textBuffer.length > 0) {
       const prev = this.textBuffer.length;
       if (!this.inThinking && !this.thinkingExtracted) {
@@ -69,6 +78,15 @@ export class ThinkingTagParser {
   }
 
   finalize(): void {
+    if (log.isDebug()) {
+      log.debug("thinking.finalize", {
+        bufferLen: this.textBuffer.length,
+        inThinking: this.inThinking,
+        thinkingExtracted: this.thinkingExtracted,
+        textBlockIndex: this.textBlockIndex,
+        thinkingBlockIndex: this.thinkingBlockIndex,
+      });
+    }
     if (this.textBuffer.length === 0) return;
     if (this.inThinking && this.thinkingBlockIndex !== null) {
       const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent | undefined;
@@ -108,6 +126,9 @@ export class ThinkingTagParser {
       }
     }
     if (bestPos !== -1 && bestVariant) {
+      if (log.isDebug()) {
+        log.debug("thinking.open", { tag: bestVariant.open, at: bestPos });
+      }
       if (bestPos > 0) this.emitText(this.textBuffer.slice(0, bestPos));
       this.textBuffer = this.textBuffer.slice(bestPos + bestVariant.open.length);
       this.activeEndTag = bestVariant.close;
@@ -129,6 +150,9 @@ export class ThinkingTagParser {
   private processInsideThinking(): void {
     const endPos = this.textBuffer.indexOf(this.activeEndTag);
     if (endPos !== -1) {
+      if (log.isDebug()) {
+        log.debug("thinking.close", { tag: this.activeEndTag, at: endPos });
+      }
       if (endPos > 0) this.emitThinking(this.textBuffer.slice(0, endPos));
       if (this.thinkingBlockIndex !== null) {
         const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent | undefined;

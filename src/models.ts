@@ -145,6 +145,17 @@ export interface KiroModel {
   maxTokens: number;
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
+  /**
+   * Upstream hides reasoning from clients — no `<thinking>` tags, no native
+   * reasoning event. We emit a redacted ThinkingContent shim so downstream
+   * UIs can surface a "reasoning hidden" marker. Also disables the
+   * `<thinking_mode>` system-prompt directive, which the provider ignores.
+   *
+   * Applies to Claude Opus 4.7, which flipped Anthropic's adaptive-thinking
+   * default from "summarized" to "omitted".
+   * See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
+   */
+  reasoningHidden?: boolean;
 }
 
 export const kiroModels: KiroModel[] = [
@@ -153,6 +164,7 @@ export const kiroModels: KiroModel[] = [
     id: "claude-opus-4-7",
     name: "Claude Opus 4.7",
     reasoning: true,
+    reasoningHidden: true,
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 128_000,

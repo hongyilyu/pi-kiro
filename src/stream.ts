@@ -12,11 +12,12 @@ import type {
   Model,
   SimpleStreamOptions,
   TextContent,
+  ThinkingContent,
   ToolCall,
   ToolResultMessage,
 } from "@mariozechner/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
-import { log } from "./debug";
+import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
 import type { KiroModel } from "./models";
 import { kiroModels, resolveKiroModel } from "./models";
@@ -73,6 +74,94 @@ function isCapacityError(body: string): boolean {
 function firstTokenTimeoutForModel(modelId: string): number {
   const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
   return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Placeholder surfaced to downstream UIs during the deliberation window
+ * on models that hide reasoning (e.g. Claude Opus 4.7 with
+ * adaptive-thinking `display: "omitted"`). Emitted as a `thinking_delta`
+ * only after the countdown elapses without any real output — fast
+ * responses produce no delta at all. Clients drop the block at
+ * `thinking_end` either via the empty-text predicate (zero-delta fast
+ * path) or via a known-placeholder predicate (slow path).
+ */
+const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
+
+/**
+ * How long to wait after `thinking_start` before emitting the user-visible
+ * marker delta. Shorter than a typical user's "is this hung?" threshold so
+ * the marker appears exactly when the wait starts feeling palpable, but
+ * long enough that fast responses never flash the marker.
+ */
+export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
+
+/**
+ * Open a redacted ThinkingContent block at the start of the stream. The
+ * block begins with empty `thinking` text so every pi-ai-compatible UI
+ * treats it as a live indicator. The block is either closed empty (fast
+ * path) or has `emitHiddenReasoningMarker` mutate it mid-stream (slow
+ * path) before closing.
+ *
+ * Returns the `contentIndex` of the pushed block.
+ */
+function emitHiddenReasoningStart(
+  output: AssistantMessage,
+  stream: AssistantMessageEventStream,
+): number {
+  const contentIndex = output.content.length;
+  const block: ThinkingContent = {
+    type: "thinking",
+    thinking: "",
+    redacted: true,
+  };
+  output.content.push(block);
+  stream.push({ type: "thinking_start", contentIndex, partial: output });
+  return contentIndex;
+}
+
+/**
+ * Populate an open redacted-thinking block with the placeholder marker.
+ * Fires from the countdown timer when the first real output event hasn't
+ * arrived within `HIDDEN_REASONING_COUNTDOWN_MS`. Mutates the block in
+ * place and emits a single `thinking_delta` so UIs that render accumulated
+ * thinking text (inkstone, pi-coding-agent) display the marker until
+ * `thinking_end` arrives.
+ */
+function emitHiddenReasoningMarker(
+  output: AssistantMessage,
+  stream: AssistantMessageEventStream,
+  contentIndex: number,
+): void {
+  const block = output.content[contentIndex];
+  if (block && block.type === "thinking") {
+    block.thinking = HIDDEN_REASONING_PLACEHOLDER;
+  }
+  stream.push({
+    type: "thinking_delta",
+    contentIndex,
+    delta: HIDDEN_REASONING_PLACEHOLDER,
+    partial: output,
+  });
+}
+
+/**
+ * Close a block previously opened by `emitHiddenReasoningStart`. Always
+ * emits `thinking_end` with empty content — the accumulated text (if any)
+ * lives on `output.content[contentIndex].thinking`. UIs that drop
+ * redacted-thinking blocks do so either via an empty-text check or via a
+ * known-placeholder predicate; both shapes work with empty `content`.
+ */
+function closeHiddenReasoning(
+  output: AssistantMessage,
+  stream: AssistantMessageEventStream,
+  contentIndex: number,
+): void {
+  stream.push({
+    type: "thinking_end",
+    contentIndex,
+    content: "",
+    partial: output,
+  });
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -221,6 +310,17 @@ export function streamKiro(
       timestamp: Date.now(),
     };
 
+    // Live index of the currently-open redacted-thinking block, if any.
+    // Hoisted above the try/catch so the terminal error path can close it
+    // to prevent downstream UIs from hanging on an orphan live indicator.
+    let hiddenThinkingIndex: number | null = null;
+    // Countdown timer that emits the user-visible marker delta if the
+    // first real output event doesn't arrive within
+    // HIDDEN_REASONING_COUNTDOWN_MS of `thinking_start`. Hoisted alongside
+    // `hiddenThinkingIndex` so every exit path can cancel it.
+    let hiddenMarkerTimer: ReturnType<typeof setTimeout> | null = null;
+    let hiddenMarkerEmitted = false;
+
     try {
       const accessToken = options?.apiKey;
       if (!accessToken) {
@@ -231,6 +331,11 @@ export function streamKiro(
       const profileArn = await resolveProfileArn(accessToken, endpoint);
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
+      // Kiro models where upstream hides reasoning entirely (no `<thinking>`
+      // tags in the text stream, no native reasoning event). We surface a
+      // redacted ThinkingContent shim so downstream UIs can show a
+      // "reasoning hidden" marker via the standard pi-ai contract.
+      const reasoningHidden = !!(model as KiroModel).reasoningHidden;
 
       log.debug("request.init", {
         endpoint,
@@ -238,6 +343,7 @@ export function streamKiro(
         kiroModelId,
         contextWindow: model.contextWindow,
         thinkingEnabled,
+        reasoningHidden,
         reasoning: options?.reasoning,
         messageCount: context.messages.length,
         toolCount: context.tools?.length ?? 0,
@@ -247,7 +353,9 @@ export function streamKiro(
       });
 
       let systemPrompt = context.systemPrompt ?? "";
-      if (thinkingEnabled) {
+      // Skip the `<thinking_mode>` directive when the provider hides
+      // reasoning — the directive is a no-op there and costs prompt tokens.
+      if (thinkingEnabled && !reasoningHidden) {
         const budget =
           options?.reasoning === "xhigh"
             ? 50000
@@ -406,6 +514,24 @@ export function streamKiro(
         };
 
         // -- HTTP request with capacity-retry inner loop -----------------
+        // Emit `start` and the hidden-reasoning indicator *before* the
+        // fetch so the live indicator covers the server-side deliberation
+        // window (which is where the 25-30s wait actually happens on
+        // Claude 4.7 — the model reasons before sending any bytes).
+        stream.push({ type: "start", partial: output });
+        if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
+          hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
+          hiddenMarkerEmitted = false;
+          const idx = hiddenThinkingIndex;
+          hiddenMarkerTimer = setTimeout(() => {
+            hiddenMarkerTimer = null;
+            if (hiddenThinkingIndex === idx && !hiddenMarkerEmitted) {
+              emitHiddenReasoningMarker(output, stream, idx);
+              hiddenMarkerEmitted = true;
+            }
+          }, HIDDEN_REASONING_COUNTDOWN_MS);
+        }
+
         let response!: Response;
         let capacityRetryCount = 0;
         while (true) {
@@ -487,7 +613,6 @@ export function streamKiro(
         }
 
         // -- Consume response stream -------------------------------------
-        stream.push({ type: "start", partial: output });
         const reader = response.body?.getReader();
         if (!reader) throw new Error("No response body");
 
@@ -497,8 +622,13 @@ export function streamKiro(
         let lastContentData = "";
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
+        let chunkSeq = 0;
+        let eventSeq = 0;
 
-        const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        // ThinkingTagParser is disabled for reasoningHidden models since
+        // no `<thinking>` tags will ever appear in the stream.
+        const thinkingParser =
+          thinkingEnabled && !reasoningHidden ? new ThinkingTagParser(output, stream) : null;
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
@@ -507,6 +637,34 @@ export function streamKiro(
           if (!currentToolCall) return;
           if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
           currentToolCall = null;
+        };
+
+        /** Cancel the countdown timer without closing the block. */
+        const cancelHiddenMarkerTimer = () => {
+          if (hiddenMarkerTimer) {
+            clearTimeout(hiddenMarkerTimer);
+            hiddenMarkerTimer = null;
+          }
+        };
+
+        /**
+         * Close the hidden-reasoning block before the first real
+         * content/tool event is emitted (happy path) or on stream end
+         * (defensive). Cancels the countdown timer, emits `thinking_end`
+         * with empty content, and sets `hiddenThinkingIndex = null` so
+         * subsequent events don't try to close an already-closed block.
+         *
+         * The accumulated `thinking` text (if the countdown fired) lives
+         * on `output.content[contentIndex].thinking` — downstream UIs
+         * either drop the block via an empty-text predicate (fast path)
+         * or via a known-placeholder predicate (slow path).
+         */
+        const closeHiddenBreadcrumb = () => {
+          cancelHiddenMarkerTimer();
+          if (hiddenThinkingIndex !== null) {
+            closeHiddenReasoning(output, stream, hiddenThinkingIndex);
+            hiddenThinkingIndex = null;
+          }
         };
 
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -559,10 +717,26 @@ export function streamKiro(
 
           const { done, value } = readResult;
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+          const decoded = decoder.decode(value, { stream: true });
+          buffer += decoded;
+          if (log.isDebug()) {
+            log.debug("stream.chunk", {
+              seq: chunkSeq++,
+              bytes: value?.byteLength ?? 0,
+              decodedLen: decoded.length,
+              // Printable preview of the decoded chunk — control chars shown as \xNN.
+              preview: previewChunk(decoded),
+            });
+          }
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
           resetIdle();
+
+          if (log.isDebug() && events.length > 0) {
+            for (const ev of events) {
+              log.debug("stream.event", { seq: eventSeq++, event: ev });
+            }
+          }
 
           for (const event of events) {
             switch (event.type) {
@@ -576,6 +750,10 @@ export function streamKiro(
                 if (event.data === lastContentData) continue;
                 lastContentData = event.data;
                 totalContent += event.data;
+                // Close the live indicator before the first real text so
+                // the breadcrumb finalizes adjacent to — not overlapping —
+                // the text block.
+                closeHiddenBreadcrumb();
                 if (thinkingParser) {
                   thinkingParser.processChunk(event.data);
                 } else {
@@ -599,6 +777,9 @@ export function streamKiro(
               }
               case "toolUse": {
                 const tc = event.data;
+                // Close the live indicator before any tool-call events so
+                // the breadcrumb finalizes above the tool execution.
+                closeHiddenBreadcrumb();
                 sawAnyToolCalls = true;
                 if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
                   flushToolCall();
@@ -644,6 +825,12 @@ export function streamKiro(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
             await abortableDelay(delayMs, options?.signal);
+            // Close any open live indicator (cancels the countdown timer
+            // and emits thinking_end with empty content) so the retry can
+            // open a fresh block at contentIndex 0. pi-agent-core's
+            // indexed assignment overwrites the prior block on the new
+            // thinking_start, keeping consumer state in sync.
+            closeHiddenBreadcrumb();
             // Reset output content. Consumer-side `partial.content[contentIndex]`
             // (see pi-agent-core proxy.js) uses indexed assignment, so when the
             // retry re-emits `text_start` at contentIndex 0 it overwrites the
@@ -656,6 +843,14 @@ export function streamKiro(
           throw new Error(
             `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`,
           );
+        }
+
+        // Stream ended cleanly. If we saw any real output, close the
+        // block now. If not, defer until we know whether we'll retry so
+        // terminal-empty responses still close the block exactly once.
+        const gotAnyOutput = lastContentData !== "" || sawAnyToolCalls;
+        if (gotAnyOutput) {
+          closeHiddenBreadcrumb();
         }
 
         if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
@@ -695,12 +890,19 @@ export function streamKiro(
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             log.warn(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
+            // Close the still-open block (gotAnyOutput was false above,
+            // so the block is still open here). Cancels the countdown
+            // timer and emits thinking_end with empty content.
+            closeHiddenBreadcrumb();
             output.content = [];
             textBlockIndex = null;
             await abortableDelay(delayMs, options?.signal);
             continue;
           }
           log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
+          // No retries left — close the block so downstream doesn't hang
+          // on an orphan open thinking_start.
+          closeHiddenBreadcrumb();
         }
 
         // Stop reason classification per doc/conformance.md §35–37:
@@ -731,6 +933,20 @@ export function streamKiro(
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
+      // Close any still-open live-indicator block before the error event.
+      // Cancels the countdown timer (if still pending) so no stray
+      // thinking_delta fires after the stream ends, and emits
+      // thinking_end so downstream UIs don't hang on an orphan
+      // thinking_start. The block's accumulated text (if the countdown
+      // fired) stays on output.content[i].thinking for history/export.
+      if (hiddenMarkerTimer) {
+        clearTimeout(hiddenMarkerTimer);
+        hiddenMarkerTimer = null;
+      }
+      if (hiddenThinkingIndex !== null) {
+        closeHiddenReasoning(output, stream, hiddenThinkingIndex);
+        hiddenThinkingIndex = null;
+      }
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }

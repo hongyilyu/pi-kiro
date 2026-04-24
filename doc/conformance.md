@@ -65,6 +65,24 @@ item numbers in comments.
 26. Thinking mode injects
     `<thinking_mode>enabled</thinking_mode><max_thinking_length>{N}</max_thinking_length>`
     into the system prompt where N = 10k/20k/30k/50k based on reasoning level.
+    Skipped when `model.reasoningHidden` is true (directive is a no-op there).
+26a. Models with `reasoningHidden: true` emit a redacted `ThinkingContent`
+    block. `thinking_start` fires immediately after `start` and opens a
+    2-second countdown. If the first real output event (`content` or
+    `toolUse`) arrives before the countdown elapses, the block closes with
+    zero `thinking_delta` events and `thinking_end.content === ""` — fast
+    paths produce an empty redacted block that every pi-ai-compatible UI
+    drops via its existing empty-text predicate. If the countdown elapses
+    first, a single `thinking_delta` carrying `"Reasoning hidden by
+    provider"` is emitted as a user-visible status during the wait; the
+    block still closes with `thinking_end.content === ""` once real output
+    begins, and `output.content[i].thinking` carries the placeholder for
+    post-hoc inspection. Retry and terminal-error paths always cancel the
+    countdown before closing. Applies to Claude Opus 4.7 (Anthropic's
+    adaptive-thinking defaults `display` to `"omitted"` for 4.7+, so no
+    reasoning text reaches the wire). `ThinkingTagParser` is disabled for
+    these models — literal tag strings in text pass through verbatim.
+    See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
 
 ## Stream response
 

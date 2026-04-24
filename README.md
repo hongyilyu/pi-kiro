@@ -8,7 +8,7 @@ to pi's coding agent.
 ## Install
 
 ```bash
-pi install pi-kiro
+pi install npm:pi-kiro
 ```
 
 ## Login

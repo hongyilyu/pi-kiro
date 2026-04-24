@@ -5,6 +5,8 @@
 // (avoiding framing noise), extract brace-balanced JSON, and dispatch to
 // typed event objects.
 
+import { log } from "./debug";
+
 export type KiroStreamEvent =
   | { type: "content"; data: string }
   | { type: "toolUse"; data: { name: string; toolUseId: string; input: string; stop?: boolean } }
@@ -155,7 +157,35 @@ export function parseKiroEvents(
 
   while (pos < buffer.length) {
     const jsonStart = findNextEventStart(buffer, pos);
-    if (jsonStart < 0) break;
+    if (jsonStart < 0) {
+      // No known event prefix in the remainder. If there are brace-opens
+      // sitting in the gap, surface them — that's where an unrecognized
+      // top-level key would live.
+      if (log.isDebug()) {
+        const gap = buffer.substring(pos);
+        const braceIdx = gap.indexOf('{"');
+        if (braceIdx >= 0) {
+          log.debug("event.unmatchedBrace", {
+            from: pos + braceIdx,
+            preview: gap.substring(braceIdx, Math.min(braceIdx + 200, gap.length)),
+          });
+        }
+      }
+      break;
+    }
+
+    if (log.isDebug() && jsonStart > pos) {
+      // Bytes skipped between pos and the next known event — usually binary
+      // framing, but worth peeking at once so we can tell.
+      const skipped = buffer.substring(pos, jsonStart);
+      const braceIdx = skipped.indexOf('{"');
+      if (braceIdx >= 0) {
+        log.debug("event.skippedBrace", {
+          from: pos + braceIdx,
+          preview: skipped.substring(braceIdx, Math.min(braceIdx + 200, skipped.length)),
+        });
+      }
+    }
 
     const jsonEnd = findJsonEnd(buffer, jsonStart);
     if (jsonEnd < 0) {
@@ -169,9 +199,22 @@ export function parseKiroEvents(
         unknown
       >;
       const event = parseKiroEvent(parsed);
-      if (event) events.push(event);
-    } catch {
+      if (event) {
+        events.push(event);
+      } else if (log.isDebug()) {
+        // Frame parsed cleanly but didn't match any known event shape.
+        // This is the primary signal for a new upstream event type
+        // (e.g. a native `reasoning` / `thinking` block from Kiro 4.7).
+        log.debug("event.unknown", { keys: Object.keys(parsed), raw: parsed });
+      }
+    } catch (err) {
       // Brace-balanced but not valid JSON — skip.
+      if (log.isDebug()) {
+        log.debug("event.parseFail", {
+          err: err instanceof Error ? err.message : String(err),
+          snippet: buffer.substring(jsonStart, Math.min(jsonEnd + 1, jsonStart + 200)),
+        });
+      }
     }
     pos = jsonEnd + 1;
   }
