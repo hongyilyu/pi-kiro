@@ -95,7 +95,7 @@ const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
  * timer, so the breadcrumb only fires when nothing else arrives in
  * time.
  */
-export const HIDDEN_REASONING_COUNTDOWN_MS = 3000;
+export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
 
 /**
  * Emit a complete hidden-reasoning breadcrumb as a single flush:

@@ -13,7 +13,7 @@
   pushed on `start` then possibly updated after a 2s countdown,
   leaving an empty thinking block at `content[0]` on every fast
   response — a representation bug downstream consumers worked around
-  by filtering empty thinking blocks. Now: a 3s timer arms on `start`;
+  by filtering empty thinking blocks. Now: a 2s timer arms on `start`;
   if content or a tool call arrives first, the timer is cancelled and
   no shim is emitted; otherwise the full shim (`thinking_start` +
   `thinking_delta` with marker + `thinking_end`) flushes in one shot.
