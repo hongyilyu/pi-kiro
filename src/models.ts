@@ -146,13 +146,26 @@ export interface KiroModel {
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
   /**
-   * Upstream hides reasoning from clients — no `<thinking>` tags, no native
-   * reasoning event. We emit a redacted ThinkingContent shim so downstream
-   * UIs can surface a "reasoning hidden" marker. Also disables the
-   * `<thinking_mode>` system-prompt directive, which the provider ignores.
+   * Upstream is expected to hide reasoning from clients — tags and
+   * native reasoning events should be absent. When set:
    *
-   * Applies to Claude Opus 4.7, which flipped Anthropic's adaptive-thinking
-   * default from "summarized" to "omitted".
+   *   - The `<thinking_mode>` system-prompt directive is skipped
+   *     (the provider ignores it for these models).
+   *   - A redacted-thinking breadcrumb is emitted lazily — only if
+   *     no content or tool-call arrives within
+   *     `HIDDEN_REASONING_COUNTDOWN_MS`. Fast responses emit no
+   *     thinking block; slow responses get a single "Reasoning
+   *     hidden by provider" marker so downstream UIs can surface
+   *     "the model is deliberating" during the server-side wait.
+   *
+   * Does NOT gate the ThinkingTagParser — that runs unconditionally
+   * when `reasoning` is enabled. The adaptive-thinking policy is
+   * advisory: some models (Opus 4.7) intermittently leak
+   * `<thinking>...</thinking>` tags inline, and the parser handles
+   * them correctly when they do arrive.
+   *
+   * Applies to Claude Opus 4.7, which flipped Anthropic's
+   * adaptive-thinking default from "summarized" to "omitted".
    * See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
    */
   reasoningHidden?: boolean;

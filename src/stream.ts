@@ -88,80 +88,50 @@ function firstTokenTimeoutForModel(modelId: string): number {
 const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
 
 /**
- * How long to wait after `thinking_start` before emitting the user-visible
- * marker delta. Shorter than a typical user's "is this hung?" threshold so
- * the marker appears exactly when the wait starts feeling palpable, but
- * long enough that fast responses never flash the marker.
+ * How long to wait after `start` before emitting the lazy
+ * hidden-reasoning breadcrumb. Short enough that the marker appears
+ * exactly when a wait starts feeling palpable, long enough that fast
+ * responses never flash it. Content / tool-call events cancel the
+ * timer, so the breadcrumb only fires when nothing else arrives in
+ * time.
  */
-export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
+export const HIDDEN_REASONING_COUNTDOWN_MS = 3000;
 
 /**
- * Open a redacted ThinkingContent block at the start of the stream. The
- * block begins with empty `thinking` text so every pi-ai-compatible UI
- * treats it as a live indicator. The block is either closed empty (fast
- * path) or has `emitHiddenReasoningMarker` mutate it mid-stream (slow
- * path) before closing.
+ * Emit a complete hidden-reasoning breadcrumb as a single flush:
+ * `thinking_start` + `thinking_delta(marker)` + `thinking_end`. The
+ * block carries `redacted: true` so downstream UIs can drop it by
+ * placeholder or marker predicate — Inkstone drops it via its
+ * `REDACTED_THINKING_PLACEHOLDERS` filter.
  *
- * Returns the `contentIndex` of the pushed block.
+ * Called only from the slow-path countdown timer: content and tool
+ * events cancel the timer so this never fires when real output
+ * arrived in time.
  */
-function emitHiddenReasoningStart(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-): number {
-  const contentIndex = output.content.length;
-  const block: ThinkingContent = {
-    type: "thinking",
-    thinking: "",
-    redacted: true,
-  };
-  output.content.push(block);
-  stream.push({ type: "thinking_start", contentIndex, partial: output });
-  return contentIndex;
-}
-
-/**
- * Populate an open redacted-thinking block with the placeholder marker.
- * Fires from the countdown timer when the first real output event hasn't
- * arrived within `HIDDEN_REASONING_COUNTDOWN_MS`. Mutates the block in
- * place and emits a single `thinking_delta` so UIs that render accumulated
- * thinking text (inkstone, pi-coding-agent) display the marker until
- * `thinking_end` arrives.
- */
-function emitHiddenReasoningMarker(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-  contentIndex: number,
+function emitHiddenReasoningLate(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
 ): void {
-  const block = output.content[contentIndex];
-  if (block && block.type === "thinking") {
-    block.thinking = HIDDEN_REASONING_PLACEHOLDER;
-  }
-  stream.push({
-    type: "thinking_delta",
-    contentIndex,
-    delta: HIDDEN_REASONING_PLACEHOLDER,
-    partial: output,
-  });
-}
-
-/**
- * Close a block previously opened by `emitHiddenReasoningStart`. Always
- * emits `thinking_end` with empty content — the accumulated text (if any)
- * lives on `output.content[contentIndex].thinking`. UIs that drop
- * redacted-thinking blocks do so either via an empty-text check or via a
- * known-placeholder predicate; both shapes work with empty `content`.
- */
-function closeHiddenReasoning(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-  contentIndex: number,
-): void {
-  stream.push({
-    type: "thinking_end",
-    contentIndex,
-    content: "",
-    partial: output,
-  });
+	const contentIndex = output.content.length;
+	const block: ThinkingContent = {
+		type: "thinking",
+		thinking: HIDDEN_REASONING_PLACEHOLDER,
+		redacted: true,
+	};
+	output.content.push(block);
+	stream.push({ type: "thinking_start", contentIndex, partial: output });
+	stream.push({
+		type: "thinking_delta",
+		contentIndex,
+		delta: HIDDEN_REASONING_PLACEHOLDER,
+		partial: output,
+	});
+	stream.push({
+		type: "thinking_end",
+		contentIndex,
+		content: "",
+		partial: output,
+	});
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -310,16 +280,14 @@ export function streamKiro(
       timestamp: Date.now(),
     };
 
-    // Live index of the currently-open redacted-thinking block, if any.
-    // Hoisted above the try/catch so the terminal error path can close it
-    // to prevent downstream UIs from hanging on an orphan live indicator.
-    let hiddenThinkingIndex: number | null = null;
-    // Countdown timer that emits the user-visible marker delta if the
-    // first real output event doesn't arrive within
-    // HIDDEN_REASONING_COUNTDOWN_MS of `thinking_start`. Hoisted alongside
-    // `hiddenThinkingIndex` so every exit path can cancel it.
-    let hiddenMarkerTimer: ReturnType<typeof setTimeout> | null = null;
-    let hiddenMarkerEmitted = false;
+    // Hidden-reasoning breadcrumb timer. Armed on `start` (for
+    // `reasoningHidden` models), cancelled as soon as any content or
+    // tool-call event arrives. If the timer fires before anything
+    // else, `emitHiddenReasoningLate` pushes a complete shim block
+    // in one flush. Hoisted above the try/catch so the terminal
+    // error path can cancel it, preventing a stray late shim from
+    // firing after the stream ended.
+    let hiddenShimTimer: ReturnType<typeof setTimeout> | null = null;
 
     try {
       const accessToken = options?.apiKey;
@@ -514,21 +482,19 @@ export function streamKiro(
         };
 
         // -- HTTP request with capacity-retry inner loop -----------------
-        // Emit `start` and the hidden-reasoning indicator *before* the
-        // fetch so the live indicator covers the server-side deliberation
-        // window (which is where the 25-30s wait actually happens on
-        // Claude 4.7 — the model reasons before sending any bytes).
+        // Emit `start` and arm the hidden-reasoning countdown. The
+        // shim is deferred: if content or a tool call arrives within
+        // HIDDEN_REASONING_COUNTDOWN_MS, the timer is cancelled and
+        // no shim is emitted. If nothing arrives in time, the timer
+        // fires a complete shim (start + delta + end) in one flush.
+        // This covers the 25-30s server-side deliberation window on
+        // Claude 4.7 without polluting fast responses with an empty
+        // thinking block.
         stream.push({ type: "start", partial: output });
-        if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
-          hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
-          hiddenMarkerEmitted = false;
-          const idx = hiddenThinkingIndex;
-          hiddenMarkerTimer = setTimeout(() => {
-            hiddenMarkerTimer = null;
-            if (hiddenThinkingIndex === idx && !hiddenMarkerEmitted) {
-              emitHiddenReasoningMarker(output, stream, idx);
-              hiddenMarkerEmitted = true;
-            }
+        if (reasoningHidden && thinkingEnabled && hiddenShimTimer === null) {
+          hiddenShimTimer = setTimeout(() => {
+            hiddenShimTimer = null;
+            emitHiddenReasoningLate(output, stream);
           }, HIDDEN_REASONING_COUNTDOWN_MS);
         }
 
@@ -625,10 +591,14 @@ export function streamKiro(
         let chunkSeq = 0;
         let eventSeq = 0;
 
-        // ThinkingTagParser is disabled for reasoningHidden models since
-        // no `<thinking>` tags will ever appear in the stream.
-        const thinkingParser =
-          thinkingEnabled && !reasoningHidden ? new ThinkingTagParser(output, stream) : null;
+        // ThinkingTagParser runs unconditionally when thinking is
+        // enabled. Defensive against providers that intermittently
+        // leak `<thinking>...</thinking>` tags despite declaring
+        // `reasoningHidden` (Claude Opus 4.7's adaptive-thinking
+        // policy is advisory, not binding).
+        const thinkingParser = thinkingEnabled
+          ? new ThinkingTagParser(output, stream)
+          : null;
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
@@ -639,31 +609,17 @@ export function streamKiro(
           currentToolCall = null;
         };
 
-        /** Cancel the countdown timer without closing the block. */
-        const cancelHiddenMarkerTimer = () => {
-          if (hiddenMarkerTimer) {
-            clearTimeout(hiddenMarkerTimer);
-            hiddenMarkerTimer = null;
-          }
-        };
-
         /**
-         * Close the hidden-reasoning block before the first real
-         * content/tool event is emitted (happy path) or on stream end
-         * (defensive). Cancels the countdown timer, emits `thinking_end`
-         * with empty content, and sets `hiddenThinkingIndex = null` so
-         * subsequent events don't try to close an already-closed block.
-         *
-         * The accumulated `thinking` text (if the countdown fired) lives
-         * on `output.content[contentIndex].thinking` — downstream UIs
-         * either drop the block via an empty-text predicate (fast path)
-         * or via a known-placeholder predicate (slow path).
+         * Cancel the hidden-reasoning countdown timer. Called on the
+         * first content / tool-call event so the shim is suppressed
+         * when real output arrives in time. No-op once the timer
+         * has already fired (the shim is self-contained and complete
+         * by then, or was never armed for non-reasoningHidden models).
          */
-        const closeHiddenBreadcrumb = () => {
-          cancelHiddenMarkerTimer();
-          if (hiddenThinkingIndex !== null) {
-            closeHiddenReasoning(output, stream, hiddenThinkingIndex);
-            hiddenThinkingIndex = null;
+        const cancelHiddenShim = () => {
+          if (hiddenShimTimer) {
+            clearTimeout(hiddenShimTimer);
+            hiddenShimTimer = null;
           }
         };
 
@@ -750,10 +706,9 @@ export function streamKiro(
                 if (event.data === lastContentData) continue;
                 lastContentData = event.data;
                 totalContent += event.data;
-                // Close the live indicator before the first real text so
-                // the breadcrumb finalizes adjacent to — not overlapping —
-                // the text block.
-                closeHiddenBreadcrumb();
+                // Cancel the deferred shim — real content arrived in
+                // time, no breadcrumb needed.
+                cancelHiddenShim();
                 if (thinkingParser) {
                   thinkingParser.processChunk(event.data);
                 } else {
@@ -777,9 +732,9 @@ export function streamKiro(
               }
               case "toolUse": {
                 const tc = event.data;
-                // Close the live indicator before any tool-call events so
-                // the breadcrumb finalizes above the tool execution.
-                closeHiddenBreadcrumb();
+                // Cancel the deferred shim — a tool call arrived in
+                // time, no breadcrumb needed.
+                cancelHiddenShim();
                 sawAnyToolCalls = true;
                 if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
                   flushToolCall();
@@ -824,13 +779,13 @@ export function streamKiro(
             log.warn(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
+            // Cancel the pending shim BEFORE the backoff delay so
+            // the timer can't fire mid-wait (exponential backoff
+            // compounds to multi-second delays, easily exceeding
+            // HIDDEN_REASONING_COUNTDOWN_MS). The retry re-arms a
+            // fresh timer on the next `start`.
+            cancelHiddenShim();
             await abortableDelay(delayMs, options?.signal);
-            // Close any open live indicator (cancels the countdown timer
-            // and emits thinking_end with empty content) so the retry can
-            // open a fresh block at contentIndex 0. pi-agent-core's
-            // indexed assignment overwrites the prior block on the new
-            // thinking_start, keeping consumer state in sync.
-            closeHiddenBreadcrumb();
             // Reset output content. Consumer-side `partial.content[contentIndex]`
             // (see pi-agent-core proxy.js) uses indexed assignment, so when the
             // retry re-emits `text_start` at contentIndex 0 it overwrites the
@@ -845,13 +800,12 @@ export function streamKiro(
           );
         }
 
-        // Stream ended cleanly. If we saw any real output, close the
-        // block now. If not, defer until we know whether we'll retry so
-        // terminal-empty responses still close the block exactly once.
-        const gotAnyOutput = lastContentData !== "" || sawAnyToolCalls;
-        if (gotAnyOutput) {
-          closeHiddenBreadcrumb();
-        }
+        // Stream ended cleanly. Cancel the deferred shim — either
+        // content/tool calls already cancelled it, or nothing arrived
+        // and the timer may still be pending (below-threshold
+        // response). Either way, we don't want a late shim to fire
+        // after `done`.
+        cancelHiddenShim();
 
         if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
         if (thinkingParser) {
@@ -890,19 +844,18 @@ export function streamKiro(
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             log.warn(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
-            // Close the still-open block (gotAnyOutput was false above,
-            // so the block is still open here). Cancels the countdown
-            // timer and emits thinking_end with empty content.
-            closeHiddenBreadcrumb();
+            // Cancel the pending shim BEFORE the backoff delay so
+            // it can't fire mid-wait. Retry re-arms a fresh timer.
+            cancelHiddenShim();
             output.content = [];
             textBlockIndex = null;
             await abortableDelay(delayMs, options?.signal);
             continue;
           }
           log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
-          // No retries left — close the block so downstream doesn't hang
-          // on an orphan open thinking_start.
-          closeHiddenBreadcrumb();
+          // No retries left — cancel any pending shim so it doesn't
+          // fire after the empty-response path returns.
+          cancelHiddenShim();
         }
 
         // Stop reason classification per doc/conformance.md §35–37:
@@ -933,19 +886,13 @@ export function streamKiro(
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
-      // Close any still-open live-indicator block before the error event.
-      // Cancels the countdown timer (if still pending) so no stray
-      // thinking_delta fires after the stream ends, and emits
-      // thinking_end so downstream UIs don't hang on an orphan
-      // thinking_start. The block's accumulated text (if the countdown
-      // fired) stays on output.content[i].thinking for history/export.
-      if (hiddenMarkerTimer) {
-        clearTimeout(hiddenMarkerTimer);
-        hiddenMarkerTimer = null;
-      }
-      if (hiddenThinkingIndex !== null) {
-        closeHiddenReasoning(output, stream, hiddenThinkingIndex);
-        hiddenThinkingIndex = null;
+      // Cancel the pending shim timer so no stray shim fires after
+      // the error event. Nothing to close — the shim is self-
+      // contained when it fires, and if the timer is still armed
+      // here the shim simply never existed.
+      if (hiddenShimTimer) {
+        clearTimeout(hiddenShimTimer);
+        hiddenShimTimer = null;
       }
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
