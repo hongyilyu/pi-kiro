@@ -48,7 +48,7 @@ describe("resolveApiRegion", () => {
   });
 
   it("passes through unmapped regions", () => {
-    expect(resolveApiRegion("ap-southeast-1")).toBe("ap-southeast-1");
+    expect(resolveApiRegion("me-south-1")).toBe("me-south-1");
   });
 });
 
