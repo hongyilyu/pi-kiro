@@ -15,12 +15,15 @@ import type {
   ThinkingContent,
   ToolCall,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
-import type { KiroModel } from "./models";
-import { kiroModels, resolveKiroModel } from "./models";
+import { resolveKiroModel } from "./models";
+import { refreshKiroToken } from "./oauth";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import {
@@ -71,9 +74,8 @@ function isCapacityError(body: string): boolean {
   return body.includes(CAPACITY_PATTERN);
 }
 
-function firstTokenTimeoutForModel(modelId: string): number {
-  const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
-  return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+function firstTokenTimeoutForModel(model: Model<Api>): number {
+  return (model as Record<string, unknown>).firstTokenTimeout as number ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
 }
 
 /**
@@ -170,13 +172,47 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
     const timer = setTimeout(resolve, ms);
     signal?.addEventListener(
       "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
+      () => { clearTimeout(timer); reject(signal.reason); },
       { once: true },
     );
   });
+}
+
+/**
+ * Try to refresh the Kiro access token using credentials from auth.json.
+ * Returns the new access token on success, or null if refresh is not possible
+ * (no credentials file, no refresh token, network error, etc.).
+ */
+async function tryRefreshToken(): Promise<string | null> {
+  try {
+    const authPath = join(homedir(), ".pi", "agent", "auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+    const kiro = auth["kiro"] as Record<string, unknown> | undefined;
+    if (!kiro?.refresh || !kiro?.access) return null;
+
+    const refreshed = await refreshKiroToken({
+      refresh: kiro.refresh as string,
+      access: kiro.access as string,
+      expires: kiro.expires as number,
+      region: kiro.region as string,
+      clientId: kiro.clientId as string,
+      clientSecret: kiro.clientSecret as string,
+      authMethod: kiro.authMethod as "builder-id" | "idc",
+    });
+
+    // Write refreshed credentials back so pi's auth-storage picks them up
+    kiro.access = refreshed.access;
+    kiro.refresh = refreshed.refresh;
+    kiro.expires = refreshed.expires;
+    writeFileSync(authPath, JSON.stringify(auth, null, 2), "utf-8");
+
+    log.info("token refreshed successfully via 403 recovery");
+    return refreshed.access;
+  } catch (e) {
+    log.warn(`token refresh via 403 recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
 }
 
 // ---- profileArn cache --------------------------------------------------
@@ -322,20 +358,23 @@ export function streamKiro(
     let hiddenMarkerEmitted = false;
 
     try {
-      const accessToken = options?.apiKey;
+      let accessToken = options?.apiKey;
       if (!accessToken) {
         throw new Error("Kiro credentials not set. Run /login kiro.");
       }
 
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
-      const profileArn = await resolveProfileArn(accessToken, endpoint);
+      // profileArn is optional — the Kiro API works without it.
+      // Skipping the ListAvailableProfiles call avoids an extra HTTP request
+      // that counts against Kiro's rate limit.
+      const profileArn: string | undefined = undefined;
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
       // tags in the text stream, no native reasoning event). We surface a
       // redacted ThinkingContent shim so downstream UIs can show a
       // "reasoning hidden" marker via the standard pi-ai contract.
-      const reasoningHidden = !!(model as KiroModel).reasoningHidden;
+      const reasoningHidden = !!(model as Record<string, unknown>).reasoningHidden;
 
       log.debug("request.init", {
         endpoint,
@@ -596,13 +635,26 @@ export function streamKiro(
             throw new Error(`Kiro API error: context_length_exceeded (${response.status} ${errText})`);
           }
           if (response.status === 403) {
-            // Access token was accepted earlier (profileArn resolved) but is
-            // now rejected — drift, revocation, or server-side invalidation.
-            // Bust the profileArn cache so the next attempt re-resolves with
-            // a fresh token, and surface a clear re-login hint.
+            // Access token rejected — try to refresh before giving up.
+            // Kiro Gateway: 403 → force_refresh() → retry request.
             profileArnCache.delete(endpoint);
+            if (retryCount < MAX_RETRIES) {
+              retryCount++;
+              const newToken = await tryRefreshToken();
+              if (newToken) {
+                accessToken = newToken;
+                const delayMs = exponentialBackoff(retryCount - 1, 500, MAX_RETRY_DELAY_MS);
+                log.warn(`403 — token refreshed, retrying in ${delayMs}ms (${retryCount}/${MAX_RETRIES})`);
+                await abortableDelay(delayMs, options?.signal);
+                continue;
+              }
+              log.warn(`403 — token refresh failed, retrying with existing token`);
+              const delayMs = exponentialBackoff(retryCount - 1, 500, MAX_RETRY_DELAY_MS);
+              await abortableDelay(delayMs, options?.signal);
+              continue;
+            }
             throw new Error(
-              `Kiro API error: access token rejected (403) — run /login kiro to re-authenticate. ${errText}`,
+              `Kiro API error: access token rejected (403) after max retries — run /login kiro to re-authenticate. ${errText}`,
             );
           }
           throw new Error(`Kiro API error: ${response.status} ${response.statusText} ${errText}`);
@@ -693,7 +745,7 @@ export function streamKiro(
               new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
                 firstTokenTimer = setTimeout(
                   () => resolve(FIRST_TOKEN_SENTINEL),
-                  firstTokenTimeoutForModel(model.id),
+                  firstTokenTimeoutForModel(model),
                 );
               }),
             ]);

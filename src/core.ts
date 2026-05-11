@@ -2,10 +2,9 @@
 //
 // Import via: `import { loginKiro, streamKiro, ... } from "pi-kiro/core"`.
 //
-// The full pi extension lives at package root (".") and depends on
-// @mariozechner/pi-coding-agent. This subpath imports only
-// @mariozechner/pi-ai (types + stream helpers), so apps embedding the
-// Kiro provider into their own UI (e.g. an opentui frontend, a server
+// The full pi extension lives at package root ("."). This subpath imports
+// only @earendil-works/pi-ai (types + stream helpers), so apps embedding
+// the Kiro provider into their own UI (e.g. an opentui frontend, a server
 // backend) don't need pi-coding-agent installed.
 //
 // Sensitive data: `KiroCredentials` contains `clientSecret` and a `refresh`
@@ -25,10 +24,10 @@ export type { KiroCredentials } from "./oauth";
 export { streamKiro } from "./stream";
 
 export {
+	buildModelsFromApi,
+	fetchAvailableModels,
 	filterModelsByRegion,
-	KIRO_MODEL_IDS,
-	kiroModels,
 	resolveApiRegion,
 	resolveKiroModel,
 } from "./models";
-export type { KiroModel } from "./models";
+export type { KiroModelDef } from "./models";
