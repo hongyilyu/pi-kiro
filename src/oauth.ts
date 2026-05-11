@@ -22,7 +22,7 @@
 // extension to fix. Report upstream: add `this.contentContainer.clear()` at
 // the top of `showPrompt`, or allocate a new Input per call.
 
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { log } from "./debug";
 
 export const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
@@ -49,8 +49,8 @@ const IDC_PROBE_REGIONS = [
   "us-west-2",
 ];
 
-/** 5-minute safety buffer subtracted from real token expiry. */
-const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
+/** 1-minute safety buffer subtracted from real token expiry (matches Kiro Gateway). */
+const EXPIRES_BUFFER_MS = 60 * 1000;
 
 export interface KiroCredentials extends OAuthCredentials {
   clientId: string;
@@ -338,7 +338,21 @@ export async function refreshKiroToken(
     headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
     body: JSON.stringify({ clientId, clientSecret, refreshToken, grantType: "refresh_token" }),
   });
-  if (!resp.ok) throw new Error(`Token refresh failed: ${resp.status}`);
+  if (!resp.ok) {
+    // 400 on refresh = token may have been invalidated by kiro-cli re-login.
+    // Graceful degradation: if the access token hasn't actually expired yet
+    // (it has a buffer baked into expires), keep using it.
+    if (resp.status === 400) {
+      const actualExpiry = credentials.expires + EXPIRES_BUFFER_MS;
+      if (Date.now() < actualExpiry) {
+        log.warn(
+          `Token refresh returned 400, but access token still valid for ${Math.round((actualExpiry - Date.now()) / 1000)}s — using existing token`,
+        );
+        return credentials as KiroCredentials;
+      }
+    }
+    throw new Error(`Token refresh failed: ${resp.status}`);
+  }
 
   const data = (await resp.json()) as {
     accessToken: string;

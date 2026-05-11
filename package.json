@@ -30,7 +30,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build:js": "bun build src/extension.ts src/core.ts --outdir dist --target node --format esm --external '@mariozechner/*'",
+    "build:js": "bun build src/extension.ts src/core.ts --outdir dist --target node --format esm --external '@earendil-works/*'",
     "build:types": "tsc -p tsconfig.build.json",
     "build": "bun run clean && bun run build:js && bun run build:types",
     "typecheck": "tsc --noEmit",

@@ -5,7 +5,7 @@
 // can display reasoning distinctly. Handles four tag variants and tokens
 // that straddle chunk boundaries.
 
-import type { AssistantMessage, AssistantMessageEventStream, TextContent, ThinkingContent } from "@mariozechner/pi-ai";
+import type { AssistantMessage, AssistantMessageEventStream, TextContent, ThinkingContent } from "@earendil-works/pi-ai";
 import { log } from "./debug";
 
 export const THINKING_START_TAG = "<thinking>";
