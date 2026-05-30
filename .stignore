@@ -1,0 +1,17 @@
+// Syncthing stignore for pi-kiro
+// Synced: source, config, docs, dist (built output)
+// Excluded: node_modules (installable), .git, build artifacts, caches
+
+node_modules
+.git
+.env
+.env.*
+*.tsbuildinfo
+.eslintcache
+.cache
+.idea
+.DS_Store
+logs
+coverage
+*.tgz
+out

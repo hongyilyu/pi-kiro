@@ -1,0 +1,5 @@
+# This directory is a Syncthing folder marker.
+# Do not delete.
+
+folderID: pi-kiro
+created: 2026-05-31T05:46:26+09:00
