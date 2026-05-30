@@ -6,6 +6,7 @@
 
 /** Canonical Kiro API IDs (dot form) accepted by the server. */
 export const KIRO_MODEL_IDS = new Set<string>([
+  "claude-opus-4.8",
   "claude-opus-4.7",
   "claude-opus-4.6",
   "claude-opus-4.6-1m",
@@ -76,6 +77,7 @@ export function resolveApiRegion(ssoRegion: string | undefined): string {
  */
 const MODELS_BY_REGION: Record<string, Set<string>> = {
   "us-east-1": new Set([
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-opus-4-6-1m",
@@ -98,6 +100,7 @@ const MODELS_BY_REGION: Record<string, Set<string>> = {
     "auto",
   ]),
   "eu-central-1": new Set([
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -168,6 +171,17 @@ export interface KiroModel {
 }
 
 export const kiroModels: KiroModel[] = [
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-opus-4-8",
+    name: "Claude Opus 4.8",
+    reasoning: true,
+    reasoningHidden: true,
+    input: MULTIMODAL,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    firstTokenTimeout: 180_000,
+  },
   {
     ...KIRO_DEFAULTS,
     id: "claude-opus-4-7",
