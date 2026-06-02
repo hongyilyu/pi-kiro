@@ -129,7 +129,17 @@ export function filterModelsByRegion<T extends { id: string }>(
   return models.filter((m) => allowed.has(m.id));
 }
 
-const BASE_URL = "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
+/** Runtime endpoint per API region. Kiro CLI 2.5+ migrated from amazonaws.com to kiro.dev. */
+const RUNTIME_ENDPOINTS: Record<string, string> = {
+  "us-east-1": "https://runtime.us-east-1.kiro.dev",
+  "eu-central-1": "https://runtime.eu-central-1.kiro.dev",
+};
+
+function resolveRuntimeUrl(apiRegion: string): string {
+  return RUNTIME_ENDPOINTS[apiRegion] ?? `https://runtime.${apiRegion}.kiro.dev`;
+}
+
+const BASE_URL = resolveRuntimeUrl("us-east-1");
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 /** Fields every Kiro model shares. Spread into each literal below. */

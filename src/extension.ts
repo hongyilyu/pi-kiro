@@ -72,7 +72,7 @@ interface ExtensionAPI {
 
 export default function (pi: ExtensionAPI): void {
   pi.registerProvider("kiro", {
-    baseUrl: "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+    baseUrl: "https://runtime.us-east-1.kiro.dev",
     api: "kiro-api",
     models: kiroModels,
     oauth: {
@@ -84,10 +84,16 @@ export default function (pi: ExtensionAPI): void {
         const apiRegion = resolveApiRegion((cred as KiroCredentials).region);
         const kiroOnly = models.filter((m) => m.provider === "kiro");
         const nonKiro = models.filter((m) => m.provider !== "kiro");
-        const scoped = filterModelsByRegion(kiroOnly, apiRegion).map((m) => ({
-          ...m,
-          baseUrl: `https://q.${apiRegion}.amazonaws.com/generateAssistantResponse`,
-        }));
+        const scoped = filterModelsByRegion(kiroOnly, apiRegion).map((m) => {
+          const endpoints: Record<string, string> = {
+            "us-east-1": "https://runtime.us-east-1.kiro.dev",
+            "eu-central-1": "https://runtime.eu-central-1.kiro.dev",
+          };
+          return {
+            ...m,
+            baseUrl: endpoints[apiRegion] ?? `https://runtime.${apiRegion}.kiro.dev`,
+          };
+        });
         return [...nonKiro, ...scoped];
       },
     },

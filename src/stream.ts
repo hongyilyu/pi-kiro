@@ -205,8 +205,11 @@ async function resolveProfileArn(accessToken: string, endpoint: string): Promise
   if (cached !== undefined) return cached;
 
   try {
+    // Kiro CLI 2.5+ migrated profile resolution to the management endpoint.
+    // runtime.us-east-1.kiro.dev → management.us-east-1.kiro.dev
     const ep = new URL(endpoint);
-    ep.pathname = ep.pathname.replace(/\/generateAssistantResponse\/?$/, "/");
+    ep.hostname = ep.hostname.replace("runtime.", "management.");
+    ep.pathname = "/";
     ep.search = "";
     ep.hash = "";
 
@@ -327,7 +330,7 @@ export function streamKiro(
         throw new Error("Kiro credentials not set. Run /login kiro.");
       }
 
-      const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
+      const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
       const profileArn = await resolveProfileArn(accessToken, endpoint);
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
