@@ -22,7 +22,13 @@ import type {
   OAuthLoginCallbacks,
   SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
-import { filterModelsByRegion, kiroModels, resolveApiRegion } from "./models";
+import {
+  fetchAvailableKiroModels,
+  filterModelsByRegion,
+  getCachedDynamicModels,
+  kiroModels,
+  resolveApiRegion,
+} from "./models";
 import { loginKiro, refreshKiroToken, type KiroCredentials } from "./oauth";
 import { streamKiro } from "./stream";
 
@@ -84,7 +90,15 @@ export default function (pi: ExtensionAPI): void {
         const apiRegion = resolveApiRegion((cred as KiroCredentials).region);
         const kiroOnly = models.filter((m) => m.provider === "kiro");
         const nonKiro = models.filter((m) => m.provider !== "kiro");
-        const scoped = filterModelsByRegion(kiroOnly, apiRegion).map((m) => ({
+
+        // Trigger dynamic discovery in the background if access token is available
+        const token = (cred as KiroCredentials).access as string | undefined;
+        if (token) {
+          fetchAvailableKiroModels({ accessToken: token, region: apiRegion }).catch(() => {});
+        }
+
+        const cached = getCachedDynamicModels(apiRegion);
+        const scoped = (cached ?? filterModelsByRegion(kiroOnly, apiRegion)).map((m) => ({
           ...m,
           baseUrl: `https://q.${apiRegion}.amazonaws.com/generateAssistantResponse`,
         }));
