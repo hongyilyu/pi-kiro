@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- **Dynamic Model Discovery**: Added `fetchAvailableKiroModels` to query the official `AmazonCodeWhispererService.ListAvailableModels` endpoint, dynamically fetching account-specific models with in-memory caching and resilient fallback.
+- **Added Latest Models**:
+  - **Claude Opus 5** (`claude-opus-5`, 1M context, 128k max tokens, reasoning support)
+  - **Claude Opus 4.8** (`claude-opus-4-8`, 1M context, 128k max tokens)
+  - **Claude Sonnet 5** (`claude-sonnet-5`, 1M context, 65k max tokens)
+  - **OpenAI GPT-5.6 Series**: `gpt-5-6-sol`, `gpt-5-6-terra`, `gpt-5-6-luna`
+  - **GLM-5** (`glm-5`, 200k context, 8k max tokens)
+- **Forward Compatibility**: Relaxed `resolveKiroModel` to format arbitrary digit-dashed model IDs without crashing on unlisted model names.
+- **New Core Exports**: Exported `fetchAvailableKiroModels`, `getCachedDynamicModels`, `clearDynamicModelCache`, `toPiModelId`, and related discovery types from `pi-kiro/core`.
+
 ## 0.1.3
 
 - Drop `@mariozechner/pi-coding-agent` as a dependency and peer. pi-kiro

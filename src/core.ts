@@ -25,10 +25,18 @@ export type { KiroCredentials } from "./oauth";
 export { streamKiro } from "./stream";
 
 export {
+	clearDynamicModelCache,
+	fetchAvailableKiroModels,
 	filterModelsByRegion,
+	getCachedDynamicModels,
 	KIRO_MODEL_IDS,
 	kiroModels,
 	resolveApiRegion,
 	resolveKiroModel,
+	toPiModelId,
 } from "./models";
-export type { KiroModel } from "./models";
+export type {
+	KiroModel,
+	ListAvailableModelsResponse,
+	RawKiroModel,
+} from "./models";

@@ -2,7 +2,7 @@
 
 [Kiro](https://kiro.dev) provider for [pi](https://github.com/badlogic/pi-mono).
 
-Adds the Kiro model family (AWS Builder ID login, CodeWhisperer streaming API)
+Adds the Kiro model family (AWS Builder ID login, CodeWhisperer streaming API, and dynamic model discovery)
 to pi's coding agent.
 
 ## Install
@@ -29,19 +29,36 @@ Tokens are stored in `~/.pi/agent/auth.json`.
 
 ## Supported models
 
-All Claude models available through the Kiro service, including:
+All frontier and open-weight models available through Kiro, including:
 
-- `claude-sonnet-4-5`
-- `claude-sonnet-4-6`
-- `claude-opus-4-7`
+- **Anthropic Claude Series**:
+  - `claude-opus-5` (Opus 5 with 1M context & 128k output)
+  - `claude-opus-4-8`
+  - `claude-opus-4-7`
+  - `claude-opus-4-6` / `claude-opus-4-6-1m`
+  - `claude-sonnet-5`
+  - `claude-sonnet-4-6` / `claude-sonnet-4-6-1m`
+  - `claude-sonnet-4-5` / `claude-sonnet-4-5-1m`
+  - `claude-haiku-4-5`
+- **OpenAI GPT-5.6 Series**:
+  - `gpt-5-6-sol` (Flagship frontier coding & planning)
+  - `gpt-5-6-terra` (Balanced agentic development)
+  - `gpt-5-6-luna` (High-speed & credit-efficient)
+- **Open-Weight Models**:
+  - `glm-5` / `glm-4-7` / `glm-4-7-flash`
+  - `deepseek-3-2`
+  - `minimax-m2-5` / `minimax-m2-1`
+  - `kimi-k2-5`
+  - `qwen3-coder-next` / `qwen3-coder-480b`
+- `auto` (Automatic router)
 
 Run `pi --list-models` for the full list once the extension is loaded.
 
-## Region support
+## Dynamic Model Discovery & Region Support
 
-Region is inferred from your Builder ID profile. Kiro API regions currently
-available: `us-east-1`, `eu-central-1`, and others. See `src/models.ts` for
-the authoritative region-to-model map.
+- **Dynamic Discovery**: When logged in, `pi-kiro` automatically queries the official AWS CodeWhisperer `ListAvailableModels` API to discover models enabled for your account and region in real time.
+- **Region Fallback**: Region is inferred from your SSO profile (e.g. `us-east-1`, `eu-central-1`). If offline or unauthenticated, `pi-kiro` uses the authoritative fallback catalog in `src/models.ts`.
+- **Forward-Compatibility**: `resolveKiroModel()` automatically formats digit-dashed IDs to dot IDs (e.g. `claude-opus-4-8` -> `claude-opus.4.8`, `gpt-5-6-sol` -> `gpt-5.6-sol`), ensuring newly released or custom models work immediately without requiring plugin updates.
 
 ## Development
 
@@ -53,7 +70,7 @@ bun run test
 
 ## Using outside pi (standalone)
 
-The provider logic (OAuth + streaming) is also exposed at `pi-kiro/core` so
+The provider logic (OAuth + streaming + dynamic discovery) is also exposed at `pi-kiro/core` so
 you can embed it into your own UI — e.g. an [opentui](https://github.com/sst/opentui)
 frontend, a backend service, or a custom CLI — without pulling
 `pi-coding-agent`.
@@ -64,6 +81,7 @@ import {
   refreshKiroToken,
   streamKiro,
   kiroModels,
+  fetchAvailableKiroModels,
   type KiroCredentials,
 } from "pi-kiro/core";
 
@@ -77,14 +95,16 @@ const creds: KiroCredentials = await loginKiro({
   signal: abortController.signal,
 });
 
-// 2. Persist `creds` in secure storage. `creds.clientSecret` and
-//    `creds.refresh` are sensitive — treat them like passwords. Call
-//    refreshKiroToken(creds) when `Date.now() > creds.expires`.
+// 2. Discover models dynamically for the authenticated account/region (optional):
+const models = (await fetchAvailableKiroModels({
+  accessToken: creds.access,
+  region: creds.region,
+})) ?? kiroModels;
 
 // 3. Stream a turn. streamKiro(model, context, options?) returns an
 //    AssistantMessageEventStream that's both async-iterable for events
 //    and awaitable via .result() for the final AssistantMessage.
-const model = kiroModels[0];
+const model = models[0];
 const stream = streamKiro(
   model,
   {
