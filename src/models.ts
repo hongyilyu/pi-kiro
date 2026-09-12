@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+
 // Kiro model catalog + ID conversion + region mapping.
 //
 // Model IDs use dashes in pi (e.g. "claude-sonnet-4-6") and dots in the Kiro
@@ -342,3 +344,66 @@ export const kiroModels: KiroModel[] = [
     maxTokens: 65_536,
   },
 ];
+
+interface KiroCliModel {
+  model_id?: unknown;
+  model_name?: unknown;
+  context_window_tokens?: unknown;
+}
+
+interface KiroCliModelList {
+  models?: KiroCliModel[];
+}
+
+/**
+ * Add models reported by the installed Kiro CLI to the static fallback catalog.
+ * Kiro rolls out model IDs independently of pi-kiro releases, so the CLI is
+ * the authoritative source when it is available.
+ */
+export function addKiroCliModels(items: readonly KiroCliModel[]): void {
+  for (const item of items) {
+    const apiId = typeof item.model_id === "string" ? item.model_id : "";
+    if (!apiId || KIRO_MODEL_IDS.has(apiId)) continue;
+
+    // Keep the API ID unchanged. IDs such as gpt-5.6-luna are valid as-is;
+    // legacy pi IDs continue to use resolveKiroModel's dash conversion.
+    const id = apiId;
+    if (kiroModels.some((model) => model.id === id)) continue;
+
+    const contextWindow =
+      typeof item.context_window_tokens === "number" && item.context_window_tokens > 0
+        ? item.context_window_tokens
+        : 200_000;
+    const name = typeof item.model_name === "string" ? item.model_name : id;
+    const multimodal = /^(claude|gpt)/i.test(id);
+
+    KIRO_MODEL_IDS.add(apiId);
+    for (const models of Object.values(MODELS_BY_REGION)) models.add(id);
+    kiroModels.push({
+      ...KIRO_DEFAULTS,
+      id,
+      name,
+      reasoning: id !== "auto",
+      input: multimodal ? MULTIMODAL : TEXT_ONLY,
+      contextWindow,
+      maxTokens: 128_000,
+    });
+  }
+}
+
+/** Best-effort discovery; the built-in catalog remains usable without Kiro CLI. */
+export function loadKiroCliModels(): void {
+  try {
+    const raw = execFileSync(
+      "kiro-cli",
+      ["chat", "--list-models", "--format", "json"],
+      { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const payload = JSON.parse(raw) as KiroCliModelList;
+    addKiroCliModels(payload.models ?? []);
+  } catch {
+    // Kiro CLI is optional; keep using the built-in catalog as a fallback.
+  }
+}
+
+loadKiroCliModels();

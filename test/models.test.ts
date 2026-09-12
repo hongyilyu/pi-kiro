@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  addKiroCliModels,
   filterModelsByRegion,
   KIRO_MODEL_IDS,
   kiroModels,
@@ -28,6 +29,36 @@ describe("resolveKiroModel", () => {
       expect(() => resolveKiroModel(m.id)).not.toThrow();
       expect(KIRO_MODEL_IDS.has(resolveKiroModel(m.id))).toBe(true);
     }
+  });
+});
+
+describe("dynamic Kiro CLI models", () => {
+  it("adds new canonical API IDs and preserves CLI metadata", () => {
+    addKiroCliModels([
+      {
+        model_id: "gpt-9.9-luna",
+        model_name: "GPT 9.9 Luna",
+        context_window_tokens: 272_000,
+      },
+    ]);
+
+    expect(kiroModels.find((m) => m.id === "gpt-9.9-luna")).toMatchObject({
+      name: "GPT 9.9 Luna",
+      contextWindow: 272_000,
+    });
+    expect(resolveKiroModel("gpt-9.9-luna")).toBe("gpt-9.9-luna");
+    expect(KIRO_MODEL_IDS.has("gpt-9.9-luna")).toBe(true);
+    expect(filterModelsByRegion(kiroModels, "us-east-1").some((m) => m.id === "gpt-9.9-luna")).toBe(true);
+  });
+
+  it("ignores malformed or duplicate CLI entries", () => {
+    const before = kiroModels.length;
+    addKiroCliModels([
+      { model_id: "gpt-9.9-luna" },
+      { model_id: 42 },
+      {},
+    ]);
+    expect(kiroModels).toHaveLength(before);
   });
 });
 

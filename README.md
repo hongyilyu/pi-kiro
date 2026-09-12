@@ -35,7 +35,11 @@ All Claude models available through the Kiro service, including:
 - `claude-sonnet-4-6`
 - `claude-opus-4-7`
 
-Run `pi --list-models` for the full list once the extension is loaded.
+Run `pi --list-models` for the full list once the extension is loaded. When
+`kiro-cli` is installed, pi-kiro also runs `kiro-cli chat --list-models
+--format json` at startup and merges the currently available models into the
+provider catalog. The built-in catalog remains available as a fallback when
+the CLI is not installed or discovery fails.
 
 ## Region support
 
