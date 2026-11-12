@@ -8,6 +8,7 @@
 export const KIRO_MODEL_IDS = new Set<string>([
   "claude-opus-5.5",
   "claude-sonnet-5.5",
+  "claude-haiku-5.5",
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-opus-4.8",
@@ -78,6 +79,7 @@ const MODELS_BY_REGION: Record<string, Set<string>> = {
   "us-east-1": new Set([
     "claude-opus-5-5",
     "claude-sonnet-5-5",
+    "claude-haiku-5-5",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-opus-4-8",
@@ -145,7 +147,11 @@ export function filterModelsByRegion<T extends { id: string }>(
   return models.filter((m) => allowed.has(m.id));
 }
 
-const BASE_URL = "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
+const BASE_URL = "https://runtime.us-east-1.kiro.dev/generateAssistantResponse";
+const BASE_URL_EU = "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse";
+// Legacy endpoint used only for ListAvailableProfiles (profileArn resolution).
+// The runtime.kiro.dev endpoints do not support this operation.
+export const PROFILE_RESOLUTION_URL = "https://q.us-east-1.amazonaws.com/";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 /** Fields every Kiro model shares. Spread into each literal below. */
@@ -211,6 +217,15 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 65_536,
     firstTokenTimeout: 180_000,
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-haiku-5-5",
+    name: "Claude Haiku 5.5",
+    reasoning: false,
+    input: MULTIMODAL,
+    contextWindow: 200_000,
+    maxTokens: 65_536,
   },
   {
     ...KIRO_DEFAULTS,

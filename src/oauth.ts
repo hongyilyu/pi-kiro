@@ -1,5 +1,8 @@
 // Kiro OAuth — AWS Builder ID and IAM Identity Center (IdC).
 //
+// Uses PKCE Authorization Code flow (required by Kiro's API as of late 2026).
+// Device code flow tokens are rejected by the backend with FEATURE_NOT_SUPPORTED.
+//
 // Two login methods, selected interactively:
 //
 //   1. Builder ID — AWS's personal-account SSO. Fixed start URL
@@ -7,22 +10,9 @@
 //   2. IdC — enterprise SSO. User supplies their company start URL
 //      (e.g. https://mycompany.awsapps.com/start); region is auto-detected
 //      across common AWS regions, or the user can specify it.
-//
-// Both methods use the same AWS SSO-OIDC device-code flow and the same
-// refresh endpoint. Social login (Google/GitHub) is not supported — it
-// requires kiro-cli, which we intentionally don't depend on.
-//
-// NOTE on mirrored-cursor rendering glitch:
-// pi's login-dialog (modes/interactive/components/login-dialog.ts) appends
-// `this.input` to `contentContainer` on every `showPrompt` call without
-// clearing the container first. The second `onPrompt` call therefore shows
-// two visible Input widgets bound to the same buffer — typing in one updates
-// both. Our user's input is still captured correctly (both widgets share
-// `this.input`). The glitch is cosmetic, upstream, and out of scope for this
-// extension to fix. Report upstream: add `this.contentContainer.clear()` at
-// the top of `showPrompt`, or allocate a new Input per call.
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
+import { createServer } from "node:http";
 import { log } from "./debug";
 
 export const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
@@ -31,8 +21,6 @@ export const SSO_SCOPES = [
   "codewhisperer:completions",
   "codewhisperer:analysis",
   "codewhisperer:conversations",
-  "codewhisperer:transformations",
-  "codewhisperer:taskassist",
 ];
 
 /** Regions probed when an IdC user leaves the region blank. */
@@ -49,41 +37,16 @@ const IDC_PROBE_REGIONS = [
   "us-west-2",
 ];
 
+const REDIRECT_PORT_MIN = 49152;
+const REDIRECT_PORT_MAX = 65535;
 /** 5-minute safety buffer subtracted from real token expiry. */
 const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
 
 export interface KiroCredentials extends OAuthCredentials {
   clientId: string;
-  /**
-   * OIDC client secret from AWS SSO-OIDC client registration.
-   *
-   * SENSITIVE: persist only in secure storage (e.g. keychain, encrypted
-   * file, HTTP-only cookie). Do not log, do not send to telemetry, do not
-   * embed in URLs or query strings. Together with `refresh`, it can mint
-   * new access tokens for the user's AWS identity.
-   */
   clientSecret: string;
   region: string;
-  /**
-   * Which SSO flow produced this credential.
-   * - `builder-id`: AWS Builder ID (personal AWS account, us-east-1).
-   * - `idc`: IAM Identity Center (enterprise SSO, any region).
-   */
   authMethod: "builder-id" | "idc";
-}
-
-interface DeviceAuthResponse {
-  verificationUri: string;
-  verificationUriComplete: string;
-  userCode: string;
-  deviceCode: string;
-  interval: number;
-  expiresIn: number;
-}
-
-interface ClientRegisterResponse {
-  clientId: string;
-  clientSecret: string;
 }
 
 interface TokenResponse {
@@ -93,130 +56,136 @@ interface TokenResponse {
   expiresIn?: number;
 }
 
-/** Promise-based delay that rejects promptly if the signal fires. */
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Login cancelled"));
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new Error("Login cancelled"));
-      },
-      { once: true },
-    );
-  });
+function randomPort(): number {
+  return Math.floor(Math.random() * (REDIRECT_PORT_MAX - REDIRECT_PORT_MIN + 1)) + REDIRECT_PORT_MIN;
 }
 
-async function tryRegisterAndAuthorize(
-  startUrl: string,
-  region: string,
-): Promise<{
+function base64url(buf: Buffer): string {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+  const { randomBytes, createHash } = await import("node:crypto");
+  const verifier = base64url(randomBytes(32));
+  const challenge = base64url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+interface ClientRegisterResult {
   clientId: string;
   clientSecret: string;
-  oidcEndpoint: string;
-  devAuth: DeviceAuthResponse;
-} | null> {
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+}
+
+async function tryRegisterClient(
+  startUrl: string,
+  region: string,
+  redirectUri: string,
+): Promise<ClientRegisterResult | null> {
   const oidcEndpoint = `https://oidc.${region}.amazonaws.com`;
 
   const regResp = await fetch(`${oidcEndpoint}/client/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
     body: JSON.stringify({
-      clientName: "pi-kiro",
+      clientName: "Kiro CLI",
       clientType: "public",
       scopes: SSO_SCOPES,
-      grantTypes: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+      grantTypes: ["authorization_code", "refresh_token"],
+      redirectUris: [redirectUri],
+      issuerUrl: startUrl,
     }),
   });
-  if (!regResp.ok) return null;
-  const { clientId, clientSecret } = (await regResp.json()) as ClientRegisterResponse;
+  if (!regResp.ok) {
+    log.debug("pkce.register.failed", { region, status: regResp.status, body: await regResp.text().catch(() => "") });
+    return null;
+  }
 
-  const devResp = await fetch(`${oidcEndpoint}/device_authorization`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
-    body: JSON.stringify({ clientId, clientSecret, startUrl }),
-  });
-  if (!devResp.ok) return null;
-
+  const data = (await regResp.json()) as {
+    clientId: string;
+    clientSecret: string;
+    authorizationEndpoint?: string;
+    tokenEndpoint?: string;
+  };
   return {
-    clientId,
-    clientSecret,
-    oidcEndpoint,
-    devAuth: (await devResp.json()) as DeviceAuthResponse,
+    clientId: data.clientId,
+    clientSecret: data.clientSecret,
+    authorizationEndpoint: `${oidcEndpoint}/authorize`,
+    tokenEndpoint: `${oidcEndpoint}/token`,
   };
 }
 
-async function pollForToken(
-  oidcEndpoint: string,
-  clientId: string,
-  clientSecret: string,
-  devAuth: DeviceAuthResponse,
-  signal: AbortSignal | undefined,
-): Promise<TokenResponse> {
-  const deadline = Date.now() + (devAuth.expiresIn || 600) * 1000;
-  const baseInterval = (devAuth.interval || 5) * 1000;
-  let interval = baseInterval;
+function waitForCallback(port: number, signal?: AbortSignal): Promise<{ code: string; state: string }> {
+  return new Promise((resolve, reject) => {
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      const error = url.searchParams.get("error");
 
-  while (Date.now() < deadline) {
-    if (signal?.aborted) throw new Error("Login cancelled");
-    await abortableDelay(interval, signal);
-
-    // Any transient failure (network, 5xx, non-JSON body) is treated like
-    // `authorization_pending` — we keep polling until the deadline. The OIDC
-    // token endpoint occasionally returns HTML error pages under load; those
-    // should not abort a still-valid device code.
-    let resp: Response;
-    try {
-      resp = await fetch(`${oidcEndpoint}/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
-        body: JSON.stringify({
-          clientId,
-          clientSecret,
-          deviceCode: devAuth.deviceCode,
-          grantType: "urn:ietf:params:oauth:grant-type:device_code",
-        }),
-      });
-    } catch {
-      continue;
-    }
-
-    // 5xx → transient, keep polling.
-    if (resp.status >= 500) continue;
-
-    let data: TokenResponse;
-    try {
-      data = (await resp.json()) as TokenResponse;
-    } catch {
-      // Non-JSON body (HTML error page, empty, etc.) — treat as transient
-      // unless the status itself is a hard 4xx we can't interpret.
-      if (!resp.ok) {
-        throw new Error(`Authorization failed: HTTP ${resp.status}`);
+      res.writeHead(200, { "Content-Type": "text/html" });
+      if (code && state) {
+        res.end(
+          "<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>",
+        );
+        server.close();
+        resolve({ code, state });
+      } else {
+        res.end(
+          `<html><body><h2>Authorization failed</h2><p>${error ?? "Unknown error"}</p></body></html>`,
+        );
+        server.close();
+        reject(new Error(`OAuth callback error: ${error ?? "no code returned"}`));
       }
-      continue;
-    }
+    });
 
-    if (!data.error && data.accessToken && data.refreshToken) return data;
-    if (data.error === "authorization_pending") continue;
-    if (data.error === "slow_down") {
-      interval += baseInterval;
-      continue;
+    server.listen(port, "127.0.0.1", () => {
+      log.debug("pkce.callback.listening", { port });
+    });
+
+    server.on("error", (err) => {
+      reject(new Error(`Callback server error: ${err.message}`));
+    });
+
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        server.close();
+        reject(new Error("Login cancelled"));
+      }, { once: true });
     }
-    if (data.error) throw new Error(`Authorization failed: ${data.error}`);
-  }
-  throw new Error("Authorization timed out");
+  });
 }
 
-/**
- * Interactive login. Asks the user to pick Builder ID or IdC, then the IdC
- * region, then runs the device-code flow.
- *
- * Uses `callbacks.onPrompt`, which is the path pi's login-dialog is wired
- * to. Escape/ctrl+c rejects the promise with "Login cancelled", propagating
- * out of this function automatically.
- */
+async function exchangeCodeForToken(
+  tokenEndpoint: string,
+  clientId: string,
+  clientSecret: string,
+  code: string,
+  redirectUri: string,
+  verifier: string,
+): Promise<TokenResponse> {
+  const resp = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
+    body: JSON.stringify({
+      clientId,
+      clientSecret,
+      grantType: "authorization_code",
+      code,
+      redirectUri,
+      codeVerifier: verifier,
+    }),
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => resp.statusText);
+    throw new Error(`Token exchange failed: ${resp.status} ${txt}`);
+  }
+
+  return resp.json() as Promise<TokenResponse>;
+}
+
 export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCredentials> {
   const urlRaw = await callbacks.onPrompt({
     message:
@@ -227,7 +196,7 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
 
   const startUrl = (urlRaw ?? "").trim();
   if (!startUrl) {
-    return runDeviceCodeFlow(callbacks, BUILDER_ID_START_URL, [BUILDER_ID_REGION], "builder-id");
+    return runPKCEFlow(callbacks, BUILDER_ID_START_URL, [BUILDER_ID_REGION], "builder-id");
   }
   if (!startUrl.startsWith("http")) {
     throw new Error(
@@ -247,59 +216,84 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
     region ? `Connecting to ${region}…` : "Detecting your Identity Center region…",
   );
 
-  return runDeviceCodeFlow(callbacks, startUrl, regions, "idc");
+  return runPKCEFlow(callbacks, startUrl, regions, "idc");
 }
 
-async function runDeviceCodeFlow(
+async function runPKCEFlow(
   callbacks: OAuthLoginCallbacks,
   startUrl: string,
   regions: string[],
   authMethod: "builder-id" | "idc",
 ): Promise<KiroCredentials> {
-  let result: Awaited<ReturnType<typeof tryRegisterAndAuthorize>> | null = null;
+  const port = randomPort();
+  const redirectUri = `http://127.0.0.1:${port}/oauth/callback`;
+  const { verifier, challenge } = await generatePKCE();
+  const state = base64url(Buffer.from(Math.random().toString()));
+
+  let reg: ClientRegisterResult | null = null;
   let detectedRegion = "";
   for (const region of regions) {
-    result = await tryRegisterAndAuthorize(startUrl, region);
-    if (result) {
+    reg = await tryRegisterClient(startUrl, region, redirectUri);
+    if (reg) {
       detectedRegion = region;
       if (regions.length > 1) callbacks.onProgress?.(`Region: ${region}`);
       break;
     }
   }
-  if (!result || !detectedRegion) {
+
+  if (!reg || !detectedRegion) {
     throw new Error(
-      `Could not authorize ${startUrl} in ${regions.join(", ")}. ` +
+      `Could not register client for ${startUrl} in ${regions.join(", ")}. ` +
         `Check your start URL${regions.length === 1 ? " and region" : ""} and try again.`,
     );
   }
 
-  // Pi's login-dialog renders `url` prominently (clickable link on macOS)
-  // and auto-opens the browser. `instructions` appears below in warning
-  // color — use it for the code + expiry hint only. Don't duplicate the URL.
-  callbacks.onAuth({
-    url: result.devAuth.verificationUriComplete,
-    instructions: `Code: ${result.devAuth.userCode}\nComplete authorization within 10 minutes.`,
+  const { clientId, clientSecret, authorizationEndpoint, tokenEndpoint } = reg;
+
+  const authParams = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
   });
 
-  callbacks.onProgress?.("Waiting for browser authorization (up to 10 minutes)…");
+  const authUrl = `${authorizationEndpoint}?${authParams.toString()}`;
 
-  const tok = await pollForToken(
-    result.oidcEndpoint,
-    result.clientId,
-    result.clientSecret,
-    result.devAuth,
-    callbacks.signal,
-  );
+  callbacks.onAuth({
+    url: authUrl,
+    instructions: "A browser window will open. Authorize pi-kiro and return here.",
+  });
+
+  callbacks.onProgress?.("Waiting for browser authorization…");
+
+  const callbackPromise = waitForCallback(port, callbacks.signal);
+
+  // Auto-open browser
+  try {
+    const { exec } = await import("node:child_process");
+    exec(`open "${authUrl}"`);
+  } catch {
+    // ignore — user can open manually from the URL shown above
+  }
+
+  const { code } = await callbackPromise;
+
+  callbacks.onProgress?.("Exchanging authorization code for tokens…");
+
+  const tok = await exchangeCodeForToken(tokenEndpoint, clientId, clientSecret, code, redirectUri, verifier);
+
   if (!tok.accessToken || !tok.refreshToken) {
     throw new Error("Authorization completed but no tokens returned");
   }
 
   return {
-    refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|${authMethod}`,
+    refresh: `${tok.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     access: tok.accessToken,
     expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
-    clientId: result.clientId,
-    clientSecret: result.clientSecret,
+    clientId,
+    clientSecret,
     region: detectedRegion,
     authMethod,
   };
@@ -313,18 +307,9 @@ export async function refreshKiroToken(
   const clientId = parts[1] ?? "";
   const clientSecret = parts[2] ?? "";
   const region = (credentials as KiroCredentials).region;
-  // Preserve whatever authMethod came in. Fall back to "idc" only for
-  // pre-existing credentials written before this field was tracked; never
-  // invent "builder-id" because we can't tell the difference retroactively.
   const inputMethod = (credentials as Partial<KiroCredentials>).authMethod;
   const authMethod: "builder-id" | "idc" =
     inputMethod === "builder-id" || inputMethod === "idc" ? inputMethod : "idc";
-  if (inputMethod !== undefined && inputMethod !== "builder-id" && inputMethod !== "idc") {
-    // Corrupt or migrated-badly credential. Refresh still works because both
-    // methods hit the same endpoint, but future code branching on authMethod
-    // would get the wrong answer.
-    log.warn(`refreshKiroToken: unrecognized authMethod "${String(inputMethod)}" — defaulting to "idc"`);
-  }
 
   if (!refreshToken || !clientId || !clientSecret || !region) {
     throw new Error(
@@ -349,9 +334,6 @@ export async function refreshKiroToken(
   return {
     refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     access: data.accessToken,
-    // Mirror loginKiro: fall back to 1h if the server omits expiresIn. Without
-    // this guard a missing field yields `expires: NaN`, which compares false
-    // against every timestamp and forces a refresh on every subsequent call.
     expires: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
     clientId,
     clientSecret,

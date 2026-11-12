@@ -40,6 +40,7 @@ import {
   TOOL_RESULT_LIMIT,
   truncate,
 } from "./transform";
+import { PROFILE_RESOLUTION_URL } from "./models";
 
 // ---- Retry / timeout constants -----------------------------------------
 
@@ -206,12 +207,12 @@ async function resolveProfileArn(accessToken: string, endpoint: string): Promise
   if (cached !== undefined) return cached;
 
   try {
-    const ep = new URL(endpoint);
-    ep.pathname = ep.pathname.replace(/\/generateAssistantResponse\/?$/, "/");
-    ep.search = "";
-    ep.hash = "";
+    // ListAvailableProfiles only works on the legacy q.amazonaws.com endpoint,
+    // not on runtime.kiro.dev. Use the legacy URL for profile resolution regardless
+    // of which endpoint the model targets.
+    const profileUrl = PROFILE_RESOLUTION_URL;
 
-    const resp = await fetch(ep.toString(), {
+    const resp = await fetch(profileUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-amz-json-1.0",
